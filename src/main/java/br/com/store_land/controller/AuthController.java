@@ -7,6 +7,10 @@ import br.com.store_land.dto.MessageResponse;
 import br.com.store_land.dto.RegisterRequest;
 import br.com.store_land.dto.ResetPasswordRequest;
 import br.com.store_land.dto.UserDto;
+import br.com.store_land.entity.PasswordResetToken;
+import br.com.store_land.entity.User;
+import br.com.store_land.repository.PasswordResetTokenRepository;
+import br.com.store_land.repository.UserRepository;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.security.SecurityRequirement;
@@ -17,7 +21,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mail.SimpleMailMessage;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.MailException;
@@ -45,8 +48,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
-import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -62,7 +65,8 @@ public class AuthController {
     private static final String GENERIC_RESET_MESSAGE =
             "Se o e-mail estiver cadastrado, enviaremos instruções para redefinir sua senha.";
 
-    private final JdbcTemplate jdbcTemplate;
+    private final UserRepository userRepository;
+    private final PasswordResetTokenRepository passwordResetTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final AuthenticationManager authenticationManager;
     private final SecurityContextRepository securityContextRepository;
@@ -72,7 +76,8 @@ public class AuthController {
     private final String mailFrom;
 
     public AuthController(
-            JdbcTemplate jdbcTemplate,
+            UserRepository userRepository,
+            PasswordResetTokenRepository passwordResetTokenRepository,
             PasswordEncoder passwordEncoder,
             AuthenticationManager authenticationManager,
             SecurityContextRepository securityContextRepository,
@@ -81,7 +86,8 @@ public class AuthController {
             @Value("${app.frontend-url}") String frontendUrl,
             @Value("${app.mail.from}") String mailFrom
     ) {
-        this.jdbcTemplate = jdbcTemplate;
+        this.userRepository = userRepository;
+        this.passwordResetTokenRepository = passwordResetTokenRepository;
         this.passwordEncoder = passwordEncoder;
         this.authenticationManager = authenticationManager;
         this.securityContextRepository = securityContextRepository;
@@ -139,12 +145,12 @@ public class AuthController {
         }
 
         try {
-            jdbcTemplate.update("""
-                            INSERT INTO users (full_name, username, email, password_hash)
-                            VALUES (?, ?, ?, ?)
-                            """,
-                    fullName, username, email, passwordEncoder.encode(password)
-            );
+            User user = new User();
+            user.setFullName(fullName);
+            user.setUsername(username);
+            user.setEmail(email);
+            user.setPasswordHash(passwordEncoder.encode(password));
+            userRepository.save(user);
         } catch (DuplicateKeyException exception) {
             throw new ResponseStatusException(
                     HttpStatus.CONFLICT,
@@ -209,38 +215,26 @@ public class AuthController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "E-mail inválido.");
         }
 
-        var users = jdbcTemplate.query("""
-                        SELECT id, email
-                        FROM users
-                        WHERE LOWER(email) = LOWER(?) AND is_active = TRUE
-                        """,
-                (resultSet, rowNumber) -> new ResetRecipient(
-                        resultSet.getLong("id"),
-                        resultSet.getString("email")
-                ),
-                email
-        );
+        User user = userRepository.findByEmailActive(email).orElse(null);
 
-        if (!users.isEmpty()) {
-            ResetRecipient recipient = users.get(0);
+        if (user != null) {
             byte[] randomToken = new byte[32];
             SECURE_RANDOM.nextBytes(randomToken);
             String token = Base64.getUrlEncoder().withoutPadding().encodeToString(randomToken);
             String tokenHash = sha256(token);
-            Instant expiresAt = Instant.now().plus(30, ChronoUnit.MINUTES);
+            OffsetDateTime expiresAt = OffsetDateTime.now().plus(30, ChronoUnit.MINUTES);
 
-            jdbcTemplate.update("""
-                            INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
-                            VALUES (?, ?, ?)
-                            """,
-                    recipient.id(), tokenHash, Timestamp.from(expiresAt)
-            );
+            PasswordResetToken resetToken = new PasswordResetToken();
+            resetToken.setUserId(user.getId());
+            resetToken.setTokenHash(tokenHash);
+            resetToken.setExpiresAt(expiresAt);
+            passwordResetTokenRepository.save(resetToken);
 
             String resetUrl = frontendUrl + "/redefinir-senha?token="
                     + URLEncoder.encode(token, StandardCharsets.UTF_8);
             SimpleMailMessage message = new SimpleMailMessage();
             message.setFrom(mailFrom);
-            message.setTo(recipient.email());
+            message.setTo(user.getEmail());
             message.setSubject("Redefinição de senha - Store Land");
             message.setText("""
                     Recebemos uma solicitação para redefinir a senha da sua conta.
@@ -253,10 +247,7 @@ public class AuthController {
             try {
                 mailSender.send(message);
             } catch (MailException exception) {
-                jdbcTemplate.update(
-                        "DELETE FROM password_reset_tokens WHERE token_hash = ?",
-                        tokenHash
-                );
+                passwordResetTokenRepository.deleteByTokenHash(tokenHash);
                 LOGGER.error(
                         "SMTP não conseguiu enviar o e-mail de recuperação ({}).",
                         exception.getClass().getSimpleName()
@@ -276,42 +267,19 @@ public class AuthController {
         String password = validatePassword(request.password());
         String tokenHash = sha256(token);
 
-        var tokens = jdbcTemplate.query("""
-                        SELECT user_id
-                        FROM password_reset_tokens
-                        WHERE token_hash = ?
-                          AND expires_at > CURRENT_TIMESTAMP
-                          AND used_at IS NULL
-                        FOR UPDATE
-                        """,
-                (resultSet, rowNumber) -> new ResetToken(
-                        resultSet.getLong("user_id")
-                ),
-                tokenHash
-        );
+        PasswordResetToken resetToken = passwordResetTokenRepository.findByTokenHashValid(tokenHash)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.BAD_REQUEST,
+                        "O link de redefinição é inválido ou expirou."
+                ));
 
-        if (tokens.isEmpty()) {
-            throw new ResponseStatusException(
-                    HttpStatus.BAD_REQUEST,
-                    "O link de redefinição é inválido ou expirou."
-            );
-        }
-
-        ResetToken resetToken = tokens.get(0);
-        jdbcTemplate.update("""
-                        UPDATE users
-                        SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                        """,
-                passwordEncoder.encode(password), resetToken.userId()
+        OffsetDateTime now = OffsetDateTime.now();
+        userRepository.updatePassword(
+                resetToken.getUserId(),
+                passwordEncoder.encode(password),
+                now
         );
-        jdbcTemplate.update("""
-                        UPDATE password_reset_tokens
-                        SET used_at = CURRENT_TIMESTAMP
-                        WHERE user_id = ? AND used_at IS NULL
-                        """,
-                resetToken.userId()
-        );
+        passwordResetTokenRepository.markAsUsed(resetToken.getUserId(), now);
         return new MessageResponse("Senha redefinida. Você já pode entrar com a nova senha.");
     }
 
@@ -329,18 +297,12 @@ public class AuthController {
     }
 
     private UserDto findUser(String username) {
-        return jdbcTemplate.queryForObject("""
-                        SELECT id, full_name, email
-                        FROM users
-                        WHERE LOWER(username) = LOWER(?)
-                        """,
-                (resultSet, rowNumber) -> new UserDto(
-                        resultSet.getLong("id"),
-                        resultSet.getString("full_name"),
-                        resultSet.getString("email")
-                ),
-                username
-        );
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND,
+                        "Usuário não encontrado."
+                ));
+        return new UserDto(user.getId(), user.getFullName(), user.getEmail());
     }
 
     private String requiredText(String value, String fieldName) {
@@ -375,10 +337,6 @@ public class AuthController {
             throw new IllegalStateException("SHA-256 não está disponível.", exception);
         }
     }
-
-    private record ResetRecipient(long id, String email) {}
-
-    private record ResetToken(long userId) {}
 
     public record CsrfResponse(String token) {}
 }

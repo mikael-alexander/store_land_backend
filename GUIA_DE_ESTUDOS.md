@@ -1082,20 +1082,19 @@ Instant expiresAt = Instant.now().plus(30, ChronoUnit.MINUTES);
 
 **Por que 30 minutos?** Balanceia segurança (janela pequena) e usabilidade (tempo suficiente para clicar no link).
 
-##### Inserção no Banco
+##### Inserção no Banco com Spring Data JPA
 
 ```java
-jdbcTemplate.update("""
-                INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
-                VALUES (?, ?, ?)
-                """,
-        recipient.id(), tokenHash, Timestamp.from(expiresAt)
-);
+PasswordResetToken resetToken = new PasswordResetToken();
+resetToken.setUserId(user.getId());
+resetToken.setTokenHash(tokenHash);
+resetToken.setExpiresAt(expiresAt);
+passwordResetTokenRepository.save(resetToken);
 ```
 
-**`jdbcTemplate.update()`:** Executa SQL que não retorna resultados (INSERT, UPDATE, DELETE).
-
-**`Timestamp.from(expiresAt)`:** Converte `java.time.Instant` em `java.sql.Timestamp` para compatibilidade JDBC.
+`PasswordResetToken` é uma entidade JPA (`@Entity`) mapeada para a tabela
+`password_reset_tokens`. O `PasswordResetTokenRepository`, que estende
+`JpaRepository`, persiste a entidade com `save()`.
 
 ##### Envio de E-mail
 
@@ -1108,10 +1107,7 @@ message.setText("""...""");
 try {
     mailSender.send(message);
 } catch (MailException exception) {
-    jdbcTemplate.update(
-            "DELETE FROM password_reset_tokens WHERE token_hash = ?",
-            tokenHash
-    );
+    passwordResetTokenRepository.deleteByTokenHash(tokenHash);
     LOGGER.error(
             "SMTP não conseguiu enviar o e-mail de recuperação ({}).",
             exception.getClass().getSimpleName()
@@ -1138,19 +1134,17 @@ public MessageResponse resetPassword(@RequestBody ResetPasswordRequest request) 
 ##### Consulta com `FOR UPDATE`
 
 ```java
-var tokens = jdbcTemplate.query("""
-                SELECT user_id
-                FROM password_reset_tokens
-                WHERE token_hash = ?
-                  AND expires_at > CURRENT_TIMESTAMP
-                  AND used_at IS NULL
-                  FOR UPDATE
-                  """,
+PasswordResetToken resetToken = passwordResetTokenRepository
+        .findByTokenHashValid(tokenHash)
+        .orElseThrow(() -> new ResponseStatusException(
+                HttpStatus.BAD_REQUEST,
+                "O link de redefinição é inválido ou expirou."
+        ));
 ```
 
-**`FOR UPDATE`:** Cláusula SQL que **trava** as linhas selecionadas até o fim da transação.
-
-**Por que usar?** Previne **race condition**: se o usuário clicar no link duas vezes simultaneamente, apenas uma transação consegue travar e usar o token. A outra falha porque não encontra linhas disponíveis.
+O método `findByTokenHashValid()` usa JPQL para buscar a entidade pelo hash,
+verificando também a expiração e se o token ainda não foi usado. O método não
+usa `FOR UPDATE`.
 
 **Condições de validação:**
 | Condição | Protege contra |
@@ -1162,23 +1156,14 @@ var tokens = jdbcTemplate.query("""
 ##### Atualização da Senha e Marcação do Token
 
 ```java
-jdbcTemplate.update("""
-                UPDATE users
-                SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-        passwordEncoder.encode(password), resetToken.userId()
+userRepository.updatePassword(
+        resetToken.getUserId(), passwordEncoder.encode(password), now
 );
-jdbcTemplate.update("""
-                UPDATE password_reset_tokens
-                SET used_at = CURRENT_TIMESTAMP
-                WHERE user_id = ? AND used_at IS NULL
-                """,
-        resetToken.userId()
-);
+passwordResetTokenRepository.markAsUsed(resetToken.getUserId(), now);
 ```
 
-**Por que `used_at IS NULL` no UPDATE?** Garante que apenas o **primeiro** uso marca o token. Usos subsequentes não fazem nada.
+`markAsUsed()` é uma atualização JPQL definida no repositório JPA. A condição
+`usedAt IS NULL` limita a atualização aos tokens ainda não utilizados.
 
 **`@Transactional`:** As duas UPDATEs estão na mesma transação. Se a segunda falhar, a primeira é rollbackada — consistência garantida.
 
@@ -1573,17 +1558,22 @@ CREATE INDEX IF NOT EXISTS password_reset_tokens_pending_expiry_idx
 - Sem boilerplate (constructor, getters, equals, hashCode, toString)
 - Serialização JSON automática via Jackson
 
-### 11.3. JdbcTemplate em vez de JPA/Hibernate
+### 11.3. Acesso ao Banco com JdbcTemplate e JPA
 
-**Padrão:** SQL direto via `JdbcTemplate` sem entidades JPA.
+**Padrão:** O projeto usa `JdbcTemplate` em operações existentes de autenticação
+e Spring Data JPA para persistir e consultar tokens de redefinição de senha.
 
-**Vantagens:**
+**Vantagens do `JdbcTemplate`:**
 - Controle total sobre as queries
 - Sem overhead de ORM
 - Sem "N+1 query problem"
 - Código mais simples para um projeto pequeno
 
-**Desvantagens:**
+**Vantagens do JPA no fluxo de tokens:**
+- Mapeamento da tabela `password_reset_tokens` na entidade `PasswordResetToken`
+- Consultas e atualizações encapsuladas em `PasswordResetTokenRepository`
+
+**Desvantagens do `JdbcTemplate`:**
 - Migrations de schema manuais
 - Mapeamento manual ResultSet → Objeto
 - Não escala bem para domínios complexos

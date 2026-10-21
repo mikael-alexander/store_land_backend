@@ -146,7 +146,9 @@ da solicitação é genérica para não revelar se o endereço de e-mail existe.
 
 O schema de referência está em
 `src/main/java/br/com/store_land/database/schema.sql`. A aplicação conecta ao
-PostgreSQL por JDBC e usa `JdbcTemplate` para as operações de autenticação.
+PostgreSQL usando Spring Data JPA para persistir e consultar os tokens de
+redefinição de senha (`PasswordResetToken`). Outras operações de autenticação
+continuam usando `JdbcTemplate`.
 
 O `application.properties` atual define `spring.jpa.hibernate.ddl-auto=update`
 e `spring.jpa.show-sql=true`. Revise essas opções antes de produção: prefira

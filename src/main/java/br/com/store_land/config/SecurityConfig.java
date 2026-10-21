@@ -1,8 +1,8 @@
 package br.com.store_land.config;
 
+import br.com.store_land.repository.UserRepository;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
 import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
@@ -33,21 +33,16 @@ public class SecurityConfig {
     }
 
     @Bean
-    UserDetailsService userDetailsService(JdbcTemplate jdbcTemplate) {
-        return username -> jdbcTemplate.query("""
-                        SELECT username, password_hash, is_active
-                        FROM users
-                        WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)
-                        """,
-                (resultSet, rowNumber) -> User.withUsername(resultSet.getString("username"))
-                        .password(resultSet.getString("password_hash"))
+    UserDetailsService userDetailsService(UserRepository userRepository) {
+        return username -> userRepository.findByUsernameOrEmail(username)
+                .map(user -> User.withUsername(user.getUsername())
+                        .password(user.getPasswordHash())
                         .authorities("ROLE_USER")
-                        .disabled(!resultSet.getBoolean("is_active"))
-                        .build(),
-                username, username
-        ).stream().findFirst().orElseThrow(
-                () -> new UsernameNotFoundException("Usuário ou senha inválidos.")
-        );
+                        .disabled(!user.getIsActive())
+                        .build())
+                .orElseThrow(
+                        () -> new UsernameNotFoundException("Usuário ou senha inválidos.")
+                );
     }
 
     @Bean
